@@ -1,0 +1,330 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+
+
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, t):
+        device = t.device
+        half_dim = self.dim // 2
+
+        t = t.view(-1, 1)
+
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+
+        args = t * emb[None, :]
+
+        return torch.cat([args.sin(), args.cos()], dim=-1)
+
+class NodeStructureEmbedding(nn.Module):
+    def __init__(self, num_regions, num_lobes, num_surfaces, num_hemispheres, embedding_dim=64):
+        super().__init__()
+        self.region_emb = nn.Embedding(num_regions, embedding_dim)
+        self.lobe_emb = nn.Embedding(num_lobes, embedding_dim)
+        self.surface_emb = nn.Embedding(num_surfaces, embedding_dim)
+        self.hemi_emb = nn.Embedding(num_hemispheres, embedding_dim)
+        self.coord_mlp = nn.Sequential(
+            nn.Linear(3, embedding_dim), nn.SiLU(), nn.Linear(embedding_dim, embedding_dim)
+        )
+
+    def forward(self, regions, lobes, surfaces, hemis, coords):
+        return (self.region_emb(regions) + self.lobe_emb(lobes) +
+                self.surface_emb(surfaces) + self.hemi_emb(hemis) +
+                self.coord_mlp(coords))
+
+
+class ConditionEncoder(nn.Module):
+    def __init__(self, embedding_dim=64):
+        super().__init__()
+        self.time_ga = nn.Sequential(
+            nn.Linear(1, embedding_dim), nn.SiLU(), nn.Linear(embedding_dim, embedding_dim)
+        )
+        self.null_embedding = nn.Parameter(torch.randn(1, embedding_dim))
+
+    def forward(self, age_ga_norm, force_null=False):
+        age_ga_norm = age_ga_norm.view(-1, 1)
+        if force_null:
+            return self.null_embedding.expand(age_ga_norm.shape[0], -1)
+        return self.time_ga(age_ga_norm)
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.block = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.LayerNorm(hidden_dim), nn.SiLU()
+        )
+
+    def forward(self, x):
+        return x + self.block(x)
+
+#
+class MultiHopNodeEmbedding(nn.Module):
+    def __init__(self, embedding_dim=64, num_hops=2, nhead=2, dropout=0.3):
+        super().__init__()
+        self.num_hops = num_hops
+        self.transformer_layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim, nhead=nhead, dim_feedforward=embedding_dim * 2,
+            dropout=dropout, batch_first=True, norm_first=True
+        )
+
+    def forward(self, x, mask=None):
+        """
+        Args:
+            x: [Batch, Nodes, Dim] node embeddings
+            mask: [Nodes, Nodes] optional attention mask (-inf where connections disallowed)
+        """
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+
+        for _ in range(self.num_hops):
+            x = self.transformer_layer(x, src_mask=mask)
+        return x
+
+
+class DynamicHypergraphLayer(nn.Module):
+
+    def __init__(self, num_nodes, node_dim, edge_dim, out_dim, max_Hyperedges=32):
+        super().__init__()
+        self.num_nodes = num_nodes
+        self.node_projectors = nn.Linear(node_dim, out_dim)
+        self.edge_projectors = nn.Linear(edge_dim, out_dim)
+        self.max_He = max_Hyperedges
+
+        # Node-based membership generator
+        self.node_h_gen = nn.Linear(out_dim, max_Hyperedges)
+
+        self.He_mlp = nn.Sequential(
+            nn.Linear(out_dim, out_dim), nn.SiLU(), nn.Linear(out_dim, out_dim)
+        )
+
+        self.p = nn.Parameter(torch.tensor([0.5]))
+        self.output_node_projector = nn.Linear(out_dim, node_dim)
+        self.output_edge_projector = nn.Linear(out_dim, edge_dim)
+        self.register_buffer('_last_H', None, persistent=False)
+
+    def forward(self, node_features, edge_features, edge_indices):
+
+        u, v = edge_indices[:, 0], edge_indices[:, 1]
+        p_constrain = torch.sigmoid(self.p)
+
+        if node_features.dim() == 2:
+            node_features = node_features.unsqueeze(0)
+
+        batch_size = edge_features.shape[0]
+        if node_features.size(0) == 1 and batch_size > 1:
+            node_features = node_features.expand(batch_size, -1, -1)
+
+        # 1. Map Nodes to Hyperedges
+        v_nodes = self.node_projectors(node_features)
+        soft_H = torch.sigmoid(self.node_h_gen(v_nodes))  # [Batch, Nodes, HE]
+        self._last_H = soft_H
+
+        he_degree = soft_H.sum(dim=1, keepdim=True).clamp(min=1)
+        He_feat = torch.bmm(soft_H.transpose(1, 2), v_nodes)
+        He_features = He_feat / he_degree.transpose(1, 2).pow(p_constrain)
+
+        # 2. Edge Integration
+        v_edges = self.edge_projectors(edge_features)
+        h_intra = soft_H[:, u, :] * soft_H[:, v, :]  # Shared hyperedge membership
+        edge_to_He_sum = torch.bmm(h_intra.transpose(1, 2), v_edges)
+        he_edge_degree = h_intra.sum(dim=1, keepdim=True).clamp(min=1)
+        He_features = self.He_mlp(He_features + (edge_to_He_sum / he_edge_degree.transpose(1, 2).pow(p_constrain)))
+
+        # num_edges = edge_features.shape[1]
+        # bridge_signal = torch.bmm((soft_H[:, u, :] * edge_features).transpose(1, 2), soft_H[:, v, :]) / num_edges
+        # bridge_signal = torch.tanh(bridge_signal)
+        num_edges = edge_features.shape[1]
+
+        edge_feat_pooled = F.adaptive_avg_pool1d(edge_features, self.max_He)
+
+        bridge_signal = torch.bmm((soft_H[:, u, :] * edge_feat_pooled).transpose(1, 2), soft_H[:, v, :]) / num_edges
+        bridge_signal = torch.tanh(bridge_signal)
+        He_features = He_features + torch.bmm(bridge_signal, He_features)
+
+        # 3. Distribution back 
+        node_degree = soft_H.sum(dim=2, keepdim=True).clamp(min=1)
+        updated_nodes = torch.bmm(soft_H, He_features) / node_degree.pow(p_constrain)
+
+        h_edge_context = (soft_H[:, u, :] + soft_H[:, v, :]) / 2
+        edge_degree = h_edge_context.sum(dim=2, keepdim=True).clamp(min=1)
+        updated_edges = torch.bmm(h_edge_context, He_features) / edge_degree.pow(p_constrain)
+
+        return (node_features + self.output_node_projector(updated_nodes),
+                edge_features + self.output_edge_projector(updated_edges))
+
+    def get_entropy_loss(self):
+        """Regularization: Sharpness + Diversity balance for hyperedge membership."""
+        if self._last_H is None:
+            return torch.tensor(0.0, device=self.p.device)
+
+        h = self._last_H.clamp(1e-6, 1.0 - 1e-6)
+        sharpness_loss = -torch.mean(h * h.log() + (1 - h) * (1 - h).log())
+
+        marginal_p = h.mean(dim=(0, 1)).clamp(min=1e-6)
+        marginal_p = marginal_p / marginal_p.sum()
+        diversity_loss = -torch.sum(marginal_p * marginal_p.log()) / math.log(self.max_He)
+
+        return (0.1 * sharpness_loss) - (2.0 * diversity_loss)
+
+
+class BrainDiffusionModel(nn.Module):
+    """
+    Flow Matching Brain Diffusion Model with Ablatable Components.
+
+    Configurable Architecture:
+    - Transformer (relational persistence)
+    - Hypergraph (community discovery)
+    - Topological Masking (anatomical constraints)
+    """
+
+    def __init__(self, num_nodes, num_regions, num_lobes, num_surfaces, num_hemispheres,
+                 edge_indices, hidden_dim=128, internal_dim=2048,
+                 use_transformer=True, use_hypergraph=True, use_topo_mask=True):
+        super().__init__()
+
+        self.num_nodes = num_nodes
+        self.data_dim = int(num_nodes * (num_nodes - 1) // 2)
+        self.use_transformer = use_transformer
+        self.use_hypergraph = use_hypergraph
+        self.use_topo_mask = use_topo_mask
+
+        # Normalization buffers
+        self.register_buffer('global_mean', torch.tensor(0.0))
+        self.register_buffer('global_std', torch.tensor(1.0))
+
+        # Core Encoders (always active)
+        self.time_mlp = nn.Sequential(
+            SinusoidalPosEmb(hidden_dim), nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(), nn.Linear(hidden_dim, hidden_dim)
+        )
+        self.cond_encoder = ConditionEncoder(hidden_dim)
+        self.node_structure_emb = NodeStructureEmbedding(
+            num_regions, num_lobes, num_surfaces, num_hemispheres, hidden_dim
+        )
+
+        # ABLATABLE COMPONENT 1: Transformer + Dynamic Signal
+        if self.use_transformer:
+            self.strength_proj = nn.Linear(1, hidden_dim)
+            self.multihop_node_emb = MultiHopNodeEmbedding(hidden_dim, num_hops=2)
+
+            # Optional Topological Masking
+            if self.use_topo_mask:
+                adj = torch.zeros((num_nodes, num_nodes))
+                adj[edge_indices[:, 0], edge_indices[:, 1]] = 1
+                adj[edge_indices[:, 1], edge_indices[:, 0]] = 1
+                adj = adj + torch.eye(num_nodes)
+                mask = torch.full((num_nodes, num_nodes), float('-inf'))
+                mask[adj == 1] = 0.0
+                self.register_buffer('adj_mask', mask)
+            else:
+                self.register_buffer('adj_mask', None)
+
+        # ABLATABLE COMPONENT 2: Hypergraph
+        if self.use_hypergraph:
+            self.hypergraph = DynamicHypergraphLayer(
+                num_nodes=num_nodes, node_dim=hidden_dim, edge_dim=hidden_dim,
+                out_dim=hidden_dim, max_Hyperedges=32
+            )
+            self.edge_input_proj = nn.Linear(1 + hidden_dim, hidden_dim)
+
+        # Fusion and Output Layers
+        self.fusion_norm = nn.LayerNorm(hidden_dim)
+        self.edge_projector = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, 1)
+        )
+        self.edge_refiner = nn.Linear(hidden_dim, 1) if self.use_hypergraph else None
+
+        # Main Flow Backbone
+        input_total = self.data_dim + hidden_dim + hidden_dim
+        self.input_proj = nn.Linear(input_total, internal_dim)
+        self.layers = nn.ModuleList([ResidualBlock(internal_dim) for _ in range(4)])
+        self.output_proj = nn.Linear(internal_dim, self.data_dim)
+
+    def forward(self, x_t, t, age_ga_norm, node_feats, edge_indices, force_null=False):
+        """
+        Flow Matching Forward Pass with Conditional Architecture.
+
+        Args:
+            x_t: [Batch, Edges] noisy connectivity state
+            t: [Batch, 1] diffusion timestep
+            age_ga_norm: [Batch, 1] normalized gestational age
+            node_feats: tuple of (regions, lobes, surfaces, hemis, coords)
+            edge_indices: [Edges, 2] connectivity matrix
+            force_null: classifier-free guidance toggle
+        """
+        batch_size = x_t.shape[0]
+        num_nodes = node_feats[0].shape[0]
+        u, v = edge_indices[:, 0], edge_indices[:, 1]
+
+        t_emb = self.time_mlp(t)
+        ga_emb = self.cond_encoder(age_ga_norm, force_null=force_null)
+
+        node_embs_base = self.node_structure_emb(*node_feats)
+        if node_embs_base.dim() == 2:
+            node_embs_base = node_embs_base.unsqueeze(0).expand(batch_size, -1, -1)
+
+        transformer_output = torch.zeros_like(node_embs_base)
+        hypergraph_output = torch.zeros_like(node_embs_base)
+
+        if self.use_transformer:
+            x_t_clean = x_t.squeeze(-1) if x_t.dim() == 3 else x_t
+            node_strength = torch.zeros((batch_size, num_nodes), device=x_t.device)
+            node_strength.index_add_(1, u, x_t_clean)
+            node_strength.index_add_(1, v, x_t_clean)
+            node_strength = (node_strength - node_strength.mean()) / (node_strength.std() + 1e-6)
+
+            dynamic_node_embs = node_embs_base + self.strength_proj(node_strength.unsqueeze(-1))
+            transformer_output = self.multihop_node_emb(dynamic_node_embs, mask=self.adj_mask)
+
+        if self.use_hypergraph:
+            x_t_feat = x_t.unsqueeze(-1) if x_t.dim() == 2 else x_t
+            edge_ctx = (node_embs_base[:, u, :] + node_embs_base[:, v, :]) / 2
+            fused_edges = self.edge_input_proj(torch.cat([x_t_feat, edge_ctx], dim=-1))
+            hypergraph_output, h_edges = self.hypergraph(node_embs_base, fused_edges, edge_indices)
+
+        combined_node_embs = self.fusion_norm(transformer_output + hypergraph_output)
+
+        x_context = torch.cat([x_t, t_emb, ga_emb], dim=-1)
+        x = self.input_proj(x_context)
+        for layer in self.layers:
+            x = layer(x)
+
+        # node_contribution = self.edge_projector(
+        #     torch.cat([combined_node_embs[:, u, :], combined_node_embs[:, v, :]], dim=-1)
+        # ).squeeze(-1)
+        node_contribution = self.edge_projector(
+            torch.cat([combined_node_embs[:, u, :], combined_node_embs[:, v, :]], dim=-1)
+        ).squeeze(-1)
+
+        edge_contribution = 0
+        if self.use_hypergraph:
+            edge_contribution = self.edge_refiner(h_edges).squeeze(-1)
+
+        base_prediction = self.output_proj(x)
+
+        # return self.output_proj(x) + node_contribution + edge_contribution
+        return base_prediction + node_contribution + edge_contribution
+
+    def get_regularization_loss(self):
+        if self.use_hypergraph:
+            return self.hypergraph.get_entropy_loss()
+        return torch.tensor(0.0, device=self.global_mean.device)
+
+
+
+class GraphAwareDiffusionModel(BrainDiffusionModel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def forward(self, x_t, t, age_ga_norm, node_feats, edge_indices, force_null=False):
+        # We explicitly define the forward pass to match the exact signature
+        # and pass the arguments up to the parent Flow architecture.
+        return super().forward(x_t, t, age_ga_norm, node_feats, edge_indices, force_null=force_null)
