@@ -1,0 +1,403 @@
+import sys
+import os
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import math
+from ablation_runner import vector_to_adjacency_matrix
+
+TARGET_DIR = "/Users/kb01352/PycharmProjects/whole_pipeline/New/ablations/responses_to_review"
+if TARGET_DIR not in sys.path:
+    sys.path.append(TARGET_DIR)
+
+from Cont_diff_comp import sample_from_diff, DiffusionSteps, sample_from_ddim
+
+
+def unified_sampler(model_name, model, target_age, device, static_node_features, edge_indices, guidance_scale=2.0, num_steps=100):
+    # if type(model).__name__ == "DiffusionModelMLP":
+    #     diffusion_steps = DiffusionSteps(T_steps=1000)
+    #
+    #     # 1. Sample using Ancestral DDPM math
+    #     vec = sample_from_diff(model, diffusion_steps, target_age, static_node_features, edge_indices, guidance_scale)
+    #
+    #     # 2. Denormalize the DDPM output so it matches the data scale
+    #     vec = vec * model.global_std + model.global_mean
+    #
+    #     # 3. Ensure no negative edge weights
+    #     return torch.clamp(torch.expm1(vec), min=0).cpu().numpy().flatten()
+    if "DDIM" in model_name:
+        diffusion_steps = DiffusionSteps(T_steps=1000)
+        vec = sample_from_ddim(model, diffusion_steps, target_age, static_node_features, edge_indices, guidance_scale,
+                               ddim_steps=50)
+        vec = vec * model.global_std + model.global_mean
+        vec= torch.clamp(torch.expm1(vec), min=0).cpu().numpy().flatten()
+
+        # 2. Standard DDPM Sampling (1000 steps, Stochastic)
+    elif "MLP" in model_name or "DDPM" in model_name:
+        diffusion_steps = DiffusionSteps(T_steps=1000)
+        vec = sample_from_diff(model, diffusion_steps, target_age, static_node_features, edge_indices, guidance_scale)
+        vec = vec * model.global_std + model.global_mean
+        vec= torch.clamp(torch.expm1(vec), min=0).cpu().numpy().flatten()
+    else:
+        from ablation_runner import sample_brain_graph
+        # Use Flow Matching ODE
+        vec= sample_brain_graph(model, target_age, device, static_node_features, edge_indices, guidance_scale,
+                                  num_steps)
+
+    vec = np.nan_to_num(vec, nan=0.0, posinf=100000.0, neginf=0.0)
+
+    vec = np.clip(vec, a_min=0.0, a_max=None)
+
+    return vec
+
+
+
+@torch.no_grad()
+def visualize_transformer_attention(model, static_node_features, device, ax=None):
+    """Extract and visualize transformer attention patterns."""
+    if getattr(model, 'use_transformer', False) == False:
+        if ax:
+            ax.text(0.5, 0.5, "Transformer Disabled", ha='center', va='center', fontsize=14)
+            ax.axis('off')
+        return None
+
+    model.eval()
+    node_embs = model.node_structure_emb(*static_node_features)
+    if node_embs.dim() == 2:
+        node_embs = node_embs.unsqueeze(0)
+
+    mha_layer = model.multihop_node_emb.transformer_layer.self_attn
+    num_heads = mha_layer.num_heads
+    embedding_dim = node_embs.shape[-1]
+    head_dim = embedding_dim // num_heads
+
+    # Extract Q, K projections
+    in_proj_weight = mha_layer.in_proj_weight
+    q_w, k_w, _ = in_proj_weight.chunk(3, dim=0)
+
+    q_out = torch.matmul(node_embs, q_w.T)
+    k_out = torch.matmul(node_embs, k_w.T)
+
+    batch_size, seq_len, _ = node_embs.shape
+    q_out = q_out.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+    k_out = k_out.view(batch_size, seq_len, num_heads, head_dim).transpose(1, 2)
+
+    # Compute attention scores
+    attn_scores = torch.matmul(q_out, k_out.transpose(-1, -2)) / math.sqrt(head_dim)
+
+    if model.use_topo_mask and model.adj_mask is not None:
+        attn_scores = attn_scores + model.adj_mask.unsqueeze(0).unsqueeze(0)
+
+    attn_weights = torch.softmax(attn_scores, dim=-1).cpu().numpy()[0]
+
+    if ax:
+        # Average across heads
+        avg_attn = attn_weights.mean(axis=0)
+        sns.heatmap(avg_attn, ax=ax, cmap='magma', cbar=True, vmin=0, vmax=0.2,
+                    xticklabels=False, yticklabels=False)
+        ax.set_title("Transformer Attention", fontsize=12, fontweight='bold')
+        ax.set_xlabel("Target Nodes")
+        ax.set_ylabel("Source Nodes")
+
+    return attn_weights
+
+
+@torch.no_grad()
+def visualize_hypergraph_membership(model, static_node_features, device, ax=None):
+    """Visualize hypergraph soft membership matrix H."""
+    if getattr(model, 'use_hypergraph', False) == False:
+        if ax:
+            ax.text(0.5, 0.5, "Hypergraph Disabled", ha='center', va='center', fontsize=14)
+            ax.axis('off')
+        return None
+
+    model.eval()
+    node_embs_base = model.node_structure_emb(*static_node_features)
+    if node_embs_base.dim() == 2:
+        node_embs_base = node_embs_base.unsqueeze(0)
+
+    dummy_strength = torch.zeros((1, 90, 1), device=device)
+
+    v_nodes = model.hypergraph.node_projectors(node_embs_base)
+    H = torch.sigmoid(model.hypergraph.node_h_gen(v_nodes))
+
+    if ax:
+        sns.heatmap(H[0].cpu().numpy(), ax=ax, cmap='viridis', cbar=True,
+                    xticklabels=False, yticklabels=False)
+        ax.set_title("Hypergraph Membership (H)", fontsize=12, fontweight='bold')
+        ax.set_xlabel("Hyperedges")
+        ax.set_ylabel("Brain Regions")
+
+    return H.cpu().numpy()
+
+
+def visualize_generated_matrix(model_name, model, target_age, device, static_node_features,
+                               edge_indices, num_nodes, ax=None):
+    vec = unified_sampler(model_name, model, target_age, device, static_node_features,
+                          edge_indices, guidance_scale=2.0, num_steps=100)
+    mat = vector_to_adjacency_matrix(vec, num_nodes)
+
+    if ax:
+        im = ax.imshow(mat, cmap='plasma', aspect='auto')
+        ax.set_title(f"Generated GA {target_age}w", fontsize=12, fontweight='bold')
+        ax.set_xlabel("Regions")
+        ax.set_ylabel("Regions")
+        plt.colorbar(im, ax=ax, fraction=0.046)
+
+    return mat
+
+
+
+
+def plot_comparison_dashboard(trained_models, static_node_features, edge_indices,
+                              device, target_age=30, num_nodes=90, save_path=None):
+    """
+    Create comprehensive comparison dashboard.
+
+    Layout:
+    - Row per model variant
+    - Columns: Attention | Hypergraph | Generated Matrix
+    """
+    num_models = len(trained_models)
+    fig, axes = plt.subplots(num_models, 3, figsize=(18, 6 * num_models))
+
+    # Handle single model case
+    if num_models == 1:
+        axes = axes.reshape(1, -1)
+
+    for i, (name, model) in enumerate(trained_models.items()):
+        print(f"Visualizing: {name}")
+
+        # Column 1: Transformer Attention
+        visualize_transformer_attention(model, static_node_features, device, ax=axes[i, 0])
+
+        # Column 2: Hypergraph Membership
+        visualize_hypergraph_membership(model, static_node_features, device, ax=axes[i, 1])
+
+        # Column 3: Generated Matrix
+        visualize_generated_matrix(name, model, target_age, device, static_node_features,
+                                   edge_indices, num_nodes, ax=axes[i, 2])
+
+        # Row label
+        axes[i, 0].set_ylabel(f"{name}\n", fontsize=14, fontweight='bold', rotation=0,
+                              labelpad=80, va='center')
+
+    plt.suptitle(f"Ablation Study Comparison Dashboard (GA {target_age}w)",
+                 fontsize=16, fontweight='bold', y=0.995)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        print(f"Dashboard saved to: {save_path}")
+
+    plt.show()
+
+
+
+
+def plot_training_curves(histories, save_path=None):
+    """Compare training/validation curves across ablations."""
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    for name, history in histories.items():
+        if 'train_loss' in history:
+            epochs = range(1, len(history['train_loss']) + 1)
+            axes[0].plot(epochs, history['train_loss'], label=name, linewidth=2)
+        else:
+            epochs = range(1, len(history['val_loss']) + 1)
+        axes[1].plot(epochs, history['val_loss'], label=name, linewidth=2)
+
+    axes[0].set_title("Training Loss", fontsize=14, fontweight='bold')
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Loss")
+    axes[0].legend()
+    axes[0].grid(alpha=0.3)
+
+    axes[1].set_title("Validation Loss", fontsize=14, fontweight='bold')
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Loss")
+    axes[1].legend()
+    axes[1].grid(alpha=0.3)
+
+    plt.suptitle("Ablation Training Curves", fontsize=16, fontweight='bold')
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+
+    plt.show()
+
+
+def plot_parameter_comparison(trained_models):
+    """Bar chart comparing model sizes."""
+    names = []
+    param_counts = []
+
+    for name, model in trained_models.items():
+        names.append(name)
+        param_counts.append(sum(p.numel() for p in model.parameters()) / 1e6)
+
+    plt.figure(figsize=(10, 6))
+    bars = plt.bar(names, param_counts, color='skyblue', edgecolor='navy', linewidth=1.5)
+
+    for bar, count in zip(bars, param_counts):
+        plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.1,
+                 f'{count:.2f}M', ha='center', fontsize=11, fontweight='bold')
+
+    plt.title("Model Parameter Count Comparison", fontsize=16, fontweight='bold')
+    plt.ylabel("Parameters (Millions)")
+    plt.xticks(rotation=45, ha='right')
+    plt.grid(axis='y', alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+
+
+def print_ablation_summary_table(trained_models):
+    """Print a formatted table summarizing each ablation variant."""
+    print("\n" + "=" * 80)
+    print("ABLATION STUDY SUMMARY")
+    print("=" * 80)
+    print(f"{'Model Name':<25} {'Transformer':<15} {'Hypergraph':<15} {'Topo Mask':<15} {'Params (M)':<12}")
+    print("-" * 80)
+
+    for name, model in trained_models.items():
+        params = sum(p.numel() for p in model.parameters()) / 1e6
+        print(f"{name:<25} "
+              f"{'✓' if getattr(model, 'use_transformer', False) else '✗':<15} "
+              f"{'✓' if getattr(model, 'use_hypergraph', False) else '✗':<15} "
+              f"{'✓' if getattr(model, 'use_topo_mask', False) else '✗':<15} "
+              f"{params:<12.2f}")
+
+    print("=" * 80 + "\n")
+
+
+
+def compare_graph_metrics(trained_models, static_node_features, edge_indices,
+                          device, dataset=None, target_ages=np.arange(24, 44, 4), num_samples=5):
+    """
+    Compare generated graph quality metrics across ablations, with a real-data baseline.
+    """
+    try:
+        import networkx as nx
+    except ImportError:
+        print("NetworkX not available. Skipping graph metrics.")
+        return
+
+    results = {name: {'ages': [], 'efficiency': []} for name in trained_models.keys()}
+
+    real_baseline = {'ages': [], 'efficiency': []}
+
+    for age in target_ages:
+        print(f"Computing metrics for Age {age}w...")
+
+        if dataset is not None:
+            # Grab all real patients within +/- 2 weeks of the target age
+            real_ages = dataset.metadata['AgeGA'].values
+            mask = (real_ages >= age - 2) & (real_ages < age + 2)
+            valid_indices = np.where(mask)[0]
+
+            if len(valid_indices) > 0:
+                real_effs = []
+                for idx in valid_indices:
+                    mat = dataset.matrices[idx].copy()
+                    np.fill_diagonal(mat, 0)
+
+                    # Exact same thresholding as the generated models
+                    thresh = np.percentile(mat, 85)
+                    binary_mat = (mat >= thresh).astype(float)
+                    G = nx.from_numpy_array(binary_mat)
+                    real_effs.append(nx.global_efficiency(G))
+
+                real_baseline['ages'].append(age)
+                real_baseline['efficiency'].append(np.mean(real_effs))
+            else:
+                real_baseline['ages'].append(age)
+                real_baseline['efficiency'].append(np.nan)  # No real data in this age bin
+
+   
+        for name, model in trained_models.items():
+            efficiencies = []
+            for _ in range(num_samples):
+                vec = unified_sampler(name, model, age, device, static_node_features,
+                                      edge_indices, guidance_scale=2.0)
+                mat = vector_to_adjacency_matrix(vec, 90)
+
+                # Threshold for binary graph
+                thresh = np.percentile(mat, 85)
+                binary_mat = (mat >= thresh).astype(float)
+                G = nx.from_numpy_array(binary_mat)
+
+                efficiencies.append(nx.global_efficiency(G))
+
+            results[name]['ages'].append(age)
+            results[name]['efficiency'].append(np.mean(efficiencies))
+
+
+    plt.figure(figsize=(10, 6))
+
+    # Plot real data baseline as a thick dashed black line
+    if dataset is not None and len(real_baseline['ages']) > 0:
+        plt.plot(real_baseline['ages'], real_baseline['efficiency'],
+                 marker='s', markersize=8, linewidth=3, color='black',
+                 linestyle='--', label='Real Data Baseline', zorder=5)
+
+    # Plot generated models
+    for name, data in results.items():
+        plt.plot(data['ages'], data['efficiency'], marker='o', linewidth=2, label=name)
+
+    plt.title("Graph Efficiency Across Gestational Age", fontsize=16, fontweight='bold')
+    plt.xlabel("Gestational Age (weeks)")
+    plt.ylabel("Global Efficiency")
+    plt.legend()
+    plt.grid(alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_training_curves(histories, save_path=None):
+    """
+    Compare training and validation curves across ablations.
+    Handles models with different epoch counts.
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+
+    colors = plt.cm.tab10(np.linspace(0, 1, len(histories)))
+
+    for i, (name, history) in enumerate(histories.items()):
+        color = colors[i]
+
+        if 'train_loss' in history and len(history['train_loss']) > 0:
+            epochs_t = range(1, len(history['train_loss']) + 1)
+            axes[0].plot(epochs_t, history['train_loss'],
+                         label=f"{name} (Train)", color=color, linewidth=2)
+
+        if 'val_loss' in history and len(history['val_loss']) > 0:
+            epochs_v = range(1, len(history['val_loss']) + 1)
+            axes[1].plot(epochs_v, history['val_loss'],
+                         label=f"{name} (Val)", color=color, linestyle='--', linewidth=2)
+
+    axes[0].set_title("Training Convergence", fontsize=14, fontweight='bold')
+    axes[0].set_xlabel("Epochs")
+    axes[0].set_ylabel("Loss Magnitude")
+    axes[0].legend()
+    axes[0].grid(alpha=0.3, linestyle=':')
+    axes[0].set_yscale('log')  # Log scale is often better if losses differ by orders of magnitude
+
+    axes[1].set_title("Validation Generalization", fontsize=14, fontweight='bold')
+    axes[1].set_xlabel("Epochs")
+    axes[1].set_ylabel("Loss Magnitude")
+    axes[1].legend()
+    axes[1].grid(alpha=0.3, linestyle=':')
+    axes[1].set_yscale('log')
+
+    plt.suptitle("Ablation Study: Training Dynamics Comparison", fontsize=16, fontweight='bold', y=1.02)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+      print(f" Training curves saved to: {save_path}")
+
+    plt.show()
