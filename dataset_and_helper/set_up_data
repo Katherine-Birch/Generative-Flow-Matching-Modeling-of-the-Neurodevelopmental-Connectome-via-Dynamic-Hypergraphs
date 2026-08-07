@@ -1,0 +1,86 @@
+import torch
+import numpy as np
+import pandas as pd
+from torch.utils.data import Dataset
+
+
+class BrainGraphDataset(Dataset):
+    """
+    Brain connectivity dataset for diffusion model training.
+
+    Args:
+        node_csv: Path to CSV with node definitions (regions, coordinates, etc.)
+        metadata_csv: Path to CSV with patient metadata (AgeGA, etc.)
+        matrices_npy: Path to .npy file with connectivity matrices [N, 90, 90]
+    """
+
+    def __init__(self, node_csv, metadata_csv, matrices_npy):
+        self.node_data = pd.read_csv(node_csv)
+        self.metadata = pd.read_csv(metadata_csv)
+        self.matrices = np.load(matrices_npy, mmap_mode='r')
+
+        # categorical mappings
+        # self.region_mapping = {k: v for v, k in enumerate(self.node_data['RegionName'].unique())}
+        # self.region_mapping = {k: v for v, k in enumerate(self.node_data['Label'].unique())}
+        # self.region_mapping = {k: v for v, k in enumerate(self.node_data['Label'].unique())}
+        self.region_mapping = {label: i for i, label in enumerate(self.node_data['Label'])}
+
+
+        self.lobe_mapping = {k: v for v, k in enumerate(self.node_data['Lobe'].unique())}
+        self.node_data['Surface'] = self.node_data['Surface'].fillna('unknown')
+        self.surface_mapping = {k: v for v, k in enumerate(self.node_data['Surface'].unique())}
+        self.hemi_mapping = {'Left': 0, 'Right': 1}
+
+        
+
+        self.node_regions = torch.tensor(
+            [self.region_mapping[l] for l in self.node_data['Label']],
+            dtype=torch.long
+        )
+        self.node_lobes = torch.tensor(
+            [self.lobe_mapping[l] for l in self.node_data['Lobe']],
+            dtype=torch.long
+        )
+        self.node_surfaces = torch.tensor(
+            [self.surface_mapping[s] for s in self.node_data['Surface']],
+            dtype=torch.long
+        )
+        self.node_hemis = torch.tensor(
+            [self.hemi_mapping[h] for h in self.node_data['Hemisphere']],
+            dtype=torch.long
+        )
+        self.node_coords = torch.tensor(
+            self.node_data[['X', 'Y', 'Z']].values,
+            dtype=torch.float32
+        )
+
+        # Create edge indices (upper triangle of connectivity matrix)
+        dummy_matrix = np.zeros((len(self.node_data), len(self.node_data)))
+        rows, cols = np.triu_indices_from(dummy_matrix, k=1)
+        self.edge_indices = torch.tensor(np.stack([rows, cols], axis=1), dtype=torch.long)
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, idx):
+        """
+        Returns:
+            dict with keys:
+                - 'x_0': log-transformed upper triangle connectivity [4005]
+                - 'age_ga': normalized gestational age [1]
+        """
+        row = self.metadata.iloc[idx]
+        matrix_patient = np.array(self.matrices[idx])
+
+        upper_tri = np.triu_indices_from(matrix_patient, k=1)
+        raw_vals = matrix_patient[upper_tri]
+
+        x_0 = torch.tensor(np.log1p(raw_vals), dtype=torch.float32)
+
+        # Normalize age: (age - 35) / 5 for approximate [-1, 1] range
+        age_ga_norm = torch.tensor([(row['AgeGA'] - 35.0) / 5.0], dtype=torch.float32)
+
+        return {
+            'x_0': x_0,
+            'age_ga': age_ga_norm,
+        }
