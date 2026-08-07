@@ -4,3 +4,6 @@ Published in the Proceedings of the 32nd ACM SIGKDD International Conference on 
 
 
 Data can be downloaded from: https://github.com/CoDe-Neuro/Predicting-age-and-clinical-risk-from-the-neonatal-connectome.git
+
+
+<img width="910" height="818" alt="image" src="https://github.com/user-attachments/assets/d14933da-d759-43bd-8121-d261e9d4f132" />
