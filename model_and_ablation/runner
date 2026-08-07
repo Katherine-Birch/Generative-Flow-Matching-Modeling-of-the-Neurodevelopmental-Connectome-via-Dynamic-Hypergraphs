@@ -1,0 +1,547 @@
+import torch
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from torch.optim.lr_scheduler import OneCycleLR
+import os
+import math
+from ablation_model import BrainDiffusionModel, GraphAwareDiffusionModel
+from utils import vector_to_adjacency_matrix as vec_to_mat, compute_node_strength
+
+import sys
+TARGET_DIR = "/Users/kb01352/PycharmProjects/whole_pipeline/New/ablations/responses_to_review"
+os.makedirs(TARGET_DIR, exist_ok=True)
+if TARGET_DIR not in sys.path:
+    sys.path.append(TARGET_DIR)
+from Cont_diff_comp import (
+    DiffusionModelMLP,
+    DiffusionSteps,
+    train_diffusion_model,
+)
+import time
+from cvae_comparison import CVAE, vae_loss
+
+
+
+
+# def train_ablation_model(name, model, train_loader, val_loader, device,
+#                          static_node_features, edge_indices, epochs=300,
+#                          lr=1e-4, save_dir='./ablation_checkpoints'):
+class IntegratedCVAE(CVAE):
+    def __init__(self, in_features=4005, latent_d=128, c_features=1):
+        # This calls the constructor from your cvae.py
+        super().__init__(
+            n_blocks=3,
+            in_features=in_features,
+            ratio=2,
+            n_layers=2,
+            latent_d=latent_d,
+            c_features=c_features
+        )
+        self.is_cvae = True
+        self.kl_w = 0.001
+
+    def compute_loss(self, x, c):
+        y, mu, logvar = self.forward(x, c)
+
+        total_loss, kl, mse = vae_loss(x, y, mu, logvar, self.kl_w)
+        return total_loss
+
+
+def train_ablation_model(name, model, train_loader, val_loader, device,
+                         static_node_features, edge_indices, epochs=300,
+                         lr=1e-4, save_dir='/Users/kb01352/PycharmProjects/whole_pipeline/New/ablations/responses_to_review'):
+    """
+
+    Train a single ablation variant.
+
+    Args:
+        name: Experiment identifier
+        model: BrainDiffusionModel instance
+        train_loader: Training DataLoader
+        val_loader: Validation DataLoader
+        device: torch device
+        static_node_features: Tuple of node metadata
+        edge_indices: Edge connectivity tensor
+        epochs: Number of training epochs
+        lr: Learning rate
+        save_dir: Directory to save checkpoints
+
+    Returns:
+        dict: Training history
+    """
+    
+
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"{name}.pth")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = OneCycleLR(optimizer, max_lr=3e-4, steps_per_epoch=len(train_loader), epochs=epochs)
+
+    best_val_loss = float('inf')
+    history = {'train_loss': [], 'val_loss': [], 'reg_loss': []}
+
+    for epoch in range(epochs):
+        model.train()
+        train_losses = []
+        reg_losses = []
+
+        for batch in train_loader:
+            x_0 = (batch['x_0'].to(device) - model.global_mean) / model.global_std
+            t = torch.rand(x_0.shape[0], 1, device=device)
+            noise = torch.randn_like(x_0)
+            x_t = t * noise + (1 - t) * x_0
+            target_v = noise - x_0
+
+            raw_age = batch['age_ga'].to(device)
+            norm_age = (raw_age - 35.0) / 5.0
+
+            # Forward pass with 10% CFG dropout
+            # pred_v = model(x_t, t, batch['age_ga'].to(device),
+            #               static_node_features, edge_indices,
+            #               force_null=np.random.rand() < 0.1)
+            pred_v = model(x_t, t, norm_age,
+                           static_node_features, edge_indices,
+                           force_null=np.random.rand() < 0.1)
+
+            fm_loss = F.huber_loss(pred_v, target_v, delta=1.0)
+
+            reg_loss = model.get_regularization_loss()
+            current_weight = min(1e-3, (epoch / 50) * 1e-3)
+            total_loss = fm_loss + current_weight * reg_loss
+
+            optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
+
+            train_losses.append(fm_loss.item())
+            reg_losses.append(reg_loss.item() if isinstance(reg_loss, torch.Tensor) else reg_loss)
+
+        model.eval()
+        val_losses = []
+
+        with torch.no_grad():
+            for batch in val_loader:
+                x_0 = (batch['x_0'].to(device) - model.global_mean) / model.global_std
+                t = torch.rand(x_0.shape[0], 1, device=device)
+                noise = torch.randn_like(x_0)
+                x_t = t * noise + (1 - t) * x_0
+                target_v = noise - x_0
+
+                raw_val_age = batch['age_ga'].to(device).view(-1, 1)
+                norm_val_age = (raw_val_age - 35.0) / 5.0
+
+                # pred_v = model(x_t, t, batch['age_ga'].to(device),
+                #               static_node_features, edge_indices, force_null=False)
+                pred_v = model(x_t, t, norm_val_age,
+                               static_node_features, edge_indices, force_null=False)
+                val_loss = F.huber_loss(pred_v, target_v, delta=1.0)
+                val_losses.append(val_loss.item())
+
+        avg_train = np.mean(train_losses)
+        avg_val = np.mean(val_losses)
+        avg_reg = np.mean(reg_losses)
+
+        history['train_loss'].append(avg_train)
+        history['val_loss'].append(avg_val)
+        history['reg_loss'].append(avg_reg)
+
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"Epoch {epoch+1:3d}/{epochs} | Train: {avg_train:.4f} | Val: {avg_val:.4f} | Reg: {avg_reg:.4f}")
+
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': best_val_loss,
+                'history': history,
+                'config': {
+                    'use_transformer': model.use_transformer,
+                    'use_hypergraph': model.use_hypergraph,
+                    'use_topo_mask': model.use_topo_mask
+                }
+            }, save_path)
+            if (epoch + 1) % 50 == 0:
+                print(f" Best model save (Val Loss: {best_val_loss:.4f})")
+
+    print(f"Training Complete! Best Val Loss: {best_val_loss:.4f}\n")
+    return model, history
+
+def train_diffusion_baseline(name, model, diffusion_steps, train_loader, val_loader, device,
+                             static_node_features, edge_indices, global_mean, global_std, epochs=300,
+                             lr=1e-4, save_dir=TARGET_DIR):
+    print(f"\n{'='*60}")
+    print(f"Training Diffusion Baseline: {name}")
+    print(f"{'='*60}")
+
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"{name}.pth")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = OneCycleLR(optimizer, max_lr=3e-4, steps_per_epoch=len(train_loader), epochs=epochs)
+    best_val_loss = float('inf')
+    history = {'train_loss': [], 'val_loss': []}
+
+    for epoch in range(epochs):
+        model.train()
+        train_losses = []
+
+        for batch in train_loader:
+            x_0 = (batch['x_0'].to(device) - global_mean) / global_std
+            raw_age = batch['age_ga'].to(device)
+            norm_age = (raw_age - 35.0) / 5.0
+
+            loss = train_diffusion_model(model, diffusion_steps, x_0, norm_age,
+                                         static_node_features, edge_indices, optimizer)
+            scheduler.step()
+            train_losses.append(loss)
+
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for batch in val_loader:
+                x_0 = (batch['x_0'].to(device) - global_mean) / global_std
+                raw_val_age = batch['age_ga'].to(device)
+                norm_val_age = (raw_val_age - 35.0) / 5.0
+
+                xt, noise = diffusion_steps.forward_diffusion(x_0, diffusion_steps.sample_timestep(x_0.shape[0]).to(device))
+                t_norm = torch.rand(x_0.shape[0], 1, device=device)
+                pred_noise = model(xt, t_norm, norm_val_age, static_node_features, edge_indices)
+                val_loss = F.mse_loss(pred_noise, noise)
+                val_losses.append(val_loss.item())
+
+        avg_train_loss = np.mean(train_losses)
+        avg_val_loss = np.mean(val_losses)
+        history['train_loss'].append(avg_train_loss)
+        history['val_loss'].append(avg_val_loss)
+
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"Epoch {epoch+1:3d}/{epochs} | Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': best_val_loss,
+                'history': history,
+                'config': {
+                    'diffusion_steps': diffusion_steps.T_steps,
+                    'lr': lr
+                }
+            }, save_path)
+            if (epoch + 1) % 50 == 0:
+                print(f"  Best diffusion model saved (Val Loss: {best_val_loss:.4f})")
+
+    print(f"Diffusion Training Complete! Best Val Loss: {best_val_loss:.4f}\n")
+    return model, history
+
+
+def train_cvae_model(name, model, train_loader, val_loader, device, epochs=300, lr=1e-4, save_dir=TARGET_DIR):
+    """Specific training loop for CVAE baseline."""
+    print(f"\n{'=' * 60}")
+    print(f" Training CVAE Baseline: {name}")
+    print(f"{'=' * 60}")
+
+    os.makedirs(save_dir, exist_ok=True)
+    save_path = os.path.join(save_dir, f"{name}.pth")
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    best_val_loss = float('inf')
+    history = {'train_loss': [], 'val_loss': []}
+
+    for epoch in range(epochs):
+        model.train()
+        train_losses = []
+        for batch in train_loader:
+            x = (batch['x_0'].to(device) - model.global_mean) / model.global_std if hasattr(model, 'global_mean') else \
+            batch['x_0'].to(device)
+            # Normalize age exactly as the Flow model does
+            c = torch.tensor([[(batch['age_ga'].item() - 35.0) / 5.0]], device=device, dtype=torch.float32) if batch[
+                                                                                                                   'age_ga'].dim() == 0 else (
+                                                                                                                                                         batch[
+                                                                                                                                                             'age_ga'].to(
+                                                                                                                                                             device).view(
+                                                                                                                                                             -1,
+                                                                                                                                                             1) - 35.0) / 5.0
+
+            loss = model.compute_loss(x, c)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            train_losses.append(loss.item())
+
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for batch in val_loader:
+                x = (batch['x_0'].to(device) - model.global_mean) / model.global_std if hasattr(model,
+                                                                                                'global_mean') else \
+                batch['x_0'].to(device)
+                c = torch.tensor([[(batch['age_ga'].item() - 35.0) / 5.0]], device=device, dtype=torch.float32) if \
+                batch['age_ga'].dim() == 0 else (batch['age_ga'].to(device).view(-1, 1) - 35.0) / 5.0
+                val_loss = model.compute_loss(x, c)
+                val_losses.append(val_loss.item())
+
+        avg_train, avg_val = np.mean(train_losses), np.mean(val_losses)
+        history['train_loss'].append(avg_train)
+        history['val_loss'].append(avg_val)
+
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"Epoch {epoch + 1:3d}/{epochs} | Train: {avg_train:.4f} | Val: {avg_val:.4f}")
+
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_loss': best_val_loss,
+                'history': history
+            }, save_path)
+
+    return model, history
+
+
+
+
+
+
+@torch.no_grad()
+def sample_brain_graph(model, target_age, device, static_node_features, edge_indices,
+                       guidance_scale=5.0, num_steps=100):
+    """
+    Sample a synthetic brain connectivity matrix using classifier-free guidance.
+
+    Args:
+        model: Trained BrainDiffusionModel
+        target_age: Gestational age in weeks
+        device: torch device
+        static_node_features: Node metadata tuple
+        edge_indices: Edge connectivity
+        guidance_scale: CFG strength (higher = stronger conditioning)
+        num_steps: Number of integration steps
+
+    Returns:
+        np.ndarray: Generated connectivity vector (denormalized)
+    """
+    model.eval()
+    norm_age = (target_age - 35.0) / 5.0
+    ga = torch.tensor([[norm_age]], device=device, dtype=torch.float32)
+
+    # Start from pure noise
+    x = torch.randn(1, model.data_dim, device=device, dtype=torch.float32)
+    ts = torch.linspace(1, 0, num_steps, device=device)
+
+    for i in range(num_steps - 1):
+        t_curr = ts[i].view(1, 1)
+        t_next = ts[i + 1].view(1, 1)
+        dt = t_next - t_curr
+
+        # Conditional and Unconditional predictions
+        v_c = model(x, t_curr, ga, static_node_features, edge_indices, force_null=False)
+        v_u = model(x, t_curr, ga, static_node_features, edge_indices, force_null=True)
+
+        # Classifier-Free Guidance
+        pred_v = v_u + guidance_scale * (v_c - v_u)
+
+        # Euler step
+        x += pred_v * dt
+
+    # Denormalize
+    x_unscaled = x * model.global_std + model.global_mean
+    return np.maximum(np.expm1(x_unscaled.cpu().numpy().flatten()), 0)
+
+
+def run_ablation_study(ablation_configs, full_dataset, train_loader, val_loader,
+                       device, epochs=300, skip_existing=True):
+    """
+    Run multiple ablation experiments.
+
+    Args:
+        ablation_configs: Dict[str, dict] - experiment name -> model config
+        full_dataset: BrainGraphDataset instance
+        train_loader: Training DataLoader
+        val_loader: Validation DataLoader
+        device: torch device
+        epochs: Training epochs per experiment
+        skip_existing: Skip training if checkpoint exists
+
+    Returns:
+        Dict[str, BrainDiffusionModel]: Trained models
+    """
+    static_node_features = (
+        full_dataset.node_regions.to(device),
+        full_dataset.node_lobes.to(device),
+        full_dataset.node_surfaces.to(device),
+        full_dataset.node_hemis.to(device),
+        full_dataset.node_coords.to(device)
+    )
+    edge_indices = full_dataset.edge_indices.to(device)
+
+    all_train = torch.cat([b['x_0'] for b in train_loader], dim=0)
+    global_mean = all_train.mean().item()
+    global_std = all_train.std().item()
+
+    trained_models = {}
+    all_histories = {}
+
+    for name, config in ablation_configs.items():
+        is_diffusion = config.get('is_diffusion', False)
+        is_cvae = config.get('is_cvae', False)
+        use_struct = config.get('use_transformer', False) or config.get('use_hypergraph', False)
+        save_dir = TARGET_DIR
+        # checkpoint_path = f"./ablation_checkpoints/{name}.pth"
+        checkpoint_path = os.path.join(save_dir, f"{name}.pth")
+
+        if is_diffusion and use_struct:
+            safe_config = {k: v for k, v in config.items() if k not in ['is_diffusion', 'input_dim', 'cond_dim']}
+            model = GraphAwareDiffusionModel(
+                num_nodes=len(full_dataset.node_data),
+                num_regions=len(full_dataset.region_mapping),
+                num_lobes=len(full_dataset.lobe_mapping),
+                num_surfaces=len(full_dataset.surface_mapping),
+                num_hemispheres=len(full_dataset.hemi_mapping),
+                edge_indices=edge_indices,
+                **safe_config
+            ).to(device)
+
+            model.global_mean.fill_(global_mean)
+            model.global_std.fill_(global_std)
+
+            diffusion_steps = DiffusionSteps(T_steps=1000)
+
+
+            if skip_existing and os.path.exists(checkpoint_path):
+                print(f"Loading existing diffusion checkpoint: {name}")
+                checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+                model.load_state_dict(checkpoint['model_state_dict'])
+                history = checkpoint.get('history', {'train_loss': [], 'val_loss': []})
+            else:
+                model, history = train_diffusion_baseline(
+                    name, model, diffusion_steps, train_loader, val_loader, device,
+                    static_node_features, edge_indices,global_mean, global_std, epochs=epochs, save_dir=save_dir
+                )
+
+        elif is_diffusion and not use_struct:
+            model = DiffusionModelMLP(
+                input_dim=config.get('input_dim', 4005),
+                hidden_dim=config.get('hidden_dim', 2048), # Increased from 256
+                cond_dim=config.get('cond_dim', 64 )     # Increased from 32
+            ).to(device)
+
+            model.global_mean = global_mean
+            model.global_std = global_std
+            diffusion_steps = DiffusionSteps(T_steps=1000)
+
+            if skip_existing and os.path.exists(checkpoint_path):
+                print(f"Loading existing diffusion checkpoint: {name}")
+                checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+                model.load_state_dict(checkpoint['model_state_dict'])
+                history = checkpoint.get('history', {'train_loss': [], 'val_loss': []})
+            else:
+                model, history = train_diffusion_baseline(
+                    name, model, diffusion_steps, train_loader, val_loader, device,
+                    static_node_features, edge_indices, global_mean, global_std,
+                    epochs=epochs, save_dir=save_dir
+                )
+
+        elif is_cvae:
+            # Initialize using the wrapper that points to your cvae.py
+            model = IntegratedCVAE(
+                in_features=config.get('input_dim', 4005),
+                latent_d=config.get('latent_d', 128)
+            ).to(device)
+
+            if skip_existing and os.path.exists(checkpoint_path):
+                print(f"Loading existing CVAE checkpoint: {name}")
+                checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+                model.load_state_dict(checkpoint['model_state_dict'])
+                history = checkpoint.get('history', {'train_loss': [], 'val_loss': []})
+            else:
+                # Call the specific training loop for VAE math
+                model, history = train_cvae_model(
+                    name, model, train_loader, val_loader, device, epochs=epochs
+                )
+
+        # if is_diffusion and not use_struct:
+        #     model = DiffusionModelMLP(
+        #         input_dim=config.get('input_dim', 4005),
+        #         # hidden_dim=config.get('hidden_dim', 256),
+        #         # cond_dim=config.get('cond_dim', 32)
+        #         hidden_dim = config.get('hidden_dim', 2048), # Increased from 256
+        #         cond_dim = config.get('cond_dim', 64 )     # Increased from 32
+        #         # } can increase these dimensions for better performance
+        #     ).to(device)
+        #
+        #     model.global_mean = global_mean
+        #     model.global_std = global_std
+        #     diffusion_steps = DiffusionSteps(T_steps=1000)
+        #
+        #     if skip_existing and os.path.exists(checkpoint_path):
+        #         print(f"Loading existing diffusion checkpoint: {name}")
+        #         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        #         model.load_state_dict(checkpoint['model_state_dict'])
+        #         history = checkpoint.get('history', {'train_loss': [], 'val_loss': []})
+        #     else:
+        #         model, history = train_diffusion_baseline(
+        #             name, model, diffusion_steps, train_loader, val_loader, device,
+        #             static_node_features, edge_indices, global_mean, global_std,
+        #             epochs=epochs, save_dir=save_dir
+        #         )
+        else:
+
+            # Initialize model
+            model = BrainDiffusionModel(
+                num_nodes=len(full_dataset.node_data),
+                num_regions=len(full_dataset.region_mapping),
+                num_lobes=len(full_dataset.lobe_mapping),
+                num_surfaces=len(full_dataset.surface_mapping),
+                num_hemispheres=len(full_dataset.hemi_mapping),
+                edge_indices=edge_indices,
+                **config
+            ).to(device)
+
+            model.global_mean.fill_(global_mean)
+            model.global_std.fill_(global_std)
+
+            # Load or train
+            if skip_existing and os.path.exists(checkpoint_path):
+                print(f"Loading existing checkpoint: {name}")
+                checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+                model.load_state_dict(checkpoint['model_state_dict'])
+                history = checkpoint.get('history', {'train_loss': [], 'val_loss': []})
+            else:
+                model, history = train_ablation_model(
+                    name, model, train_loader, val_loader, device,
+                    static_node_features, edge_indices, epochs=epochs
+                )
+
+        trained_models[name] = model
+        all_histories[name] = history
+
+    return trained_models, static_node_features, edge_indices, all_histories
+
+
+def vector_to_adjacency_matrix(vector, num_nodes):
+    matrix = np.zeros((num_nodes, num_nodes))
+    rows, cols = np.triu_indices(num_nodes, k=1)
+    matrix[rows, cols] = vector
+    return matrix + matrix.T
+
+
+def get_model_summary(model):
+    return {
+        'Total Parameters': sum(p.numel() for p in model.parameters()),
+        'Trainable Parameters': sum(p.numel() for p in model.parameters() if p.requires_grad),
+        'Uses Transformer': model.use_transformer,
+        'Uses Hypergraph': model.use_hypergraph,
+        'Uses Topo Mask': model.use_topo_mask
+    }
